@@ -112,16 +112,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
-    # ========== 5. 定义模型、数据、优化器 ==========
+    # ========== 4. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -131,7 +122,7 @@ if __name__ == "__main__":
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
-    # ========== 6. 从ckp恢复状态 ==========
+    # ========== 5. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -140,10 +131,23 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     
-    # ========== 7. DDP包模型 ==========
+    # ========== 6. DDP包模型 ==========
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
+    
+    # ========== 7. 配wandb ==========
+    wandb = None
+    if args.use_wandb and is_main_process():
+        import swanlab as wandb
+        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
+        resume = 'must' if wandb_id else None
+        # 定义本次运行的名称，包含关键超参数
+        if lm_config.use_moe:
+            wandb_run_name = f"MiniMind-Full-SFT-MoE-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        else:
+            wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb.init(project=args.wandb_project, name=wandb_run_name, logdir=args.save_dir, id=wandb_id, resume=resume)
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
