@@ -91,20 +91,20 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
 
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_ce_loss = ce_loss_raw.item()
             current_aux_loss = res.aux_loss.item() if lm_config_student.use_moe else 0.0
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / step * iters // 60 - spend_time // 60
             
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, ce: {current_ce_loss:.4f}, aux_loss: {current_aux_loss:.4f}, distill: {distill_loss.item():.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
             
@@ -118,7 +118,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
                     "epoch_time": eta_min
                 })
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config_student.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config_student.hidden_size}{moe_suffix}.pth'
@@ -126,7 +126,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config_student, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(lm_config_student, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir=f'{args.save_dir}/checkpoints')
             model.train()
             del state_dict
 
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.use_moe))
     lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir=f'{args.save_dir}/checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -207,6 +207,7 @@ if __name__ == "__main__":
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
+        model = getattr(model, '_orig_mod', model)
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])

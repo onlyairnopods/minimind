@@ -50,7 +50,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.scale(loss).backward() # scaler 用于处理 FP16 下的梯度下溢问题
 
         # 梯度更新 (Optimizer Step) - 仅在达到累积步数时执行
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             # 先将梯度 unscale (反缩放) 回 FP32，以便进行梯度裁剪
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -65,7 +65,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             optimizer.zero_grad(set_to_none=True)
 
         # 每隔 log_interval 步 或 在最后一步时记录日志
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
 
             # 还原真实的 Loss 数值用于显示 (乘以累积步数)
@@ -77,12 +77,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             # 计算 ETA (预计剩余时间)
             # 公式: (已用时间 / 当前步数) * 总步数 / 60 - 已用时间 / 60
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / step * iters // 60 - spend_time // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         # 模型保存 (Checkpointing)
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -161,6 +161,7 @@ if __name__ == "__main__":
     start_epoch, start_step = 0, 0
     if ckp_data:
         # 如果加载了 checkpoint，这里会将模型、优化器、Scaler 全部恢复到上次断掉的状态
+        model = getattr(model, '_orig_mod', model)
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])

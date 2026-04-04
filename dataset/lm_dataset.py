@@ -153,6 +153,9 @@ class DPODataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        
+        # bos_id 这里特指 Assistant 回答的起始特征，例如 "<bos>assistant\n"
+        # 只有检测到这个序列，才意味着接下来的内容是模型需要学习的回答
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
         self.samples = load_dataset('json', data_files=data_path, split='train')
@@ -162,9 +165,12 @@ class DPODataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
+        # 获取 chosen (好回答) 和 rejected (坏回答) 的对话列表
+        # 格式通常是: [{'role': 'user', 'content': '...'}, {'role': 'assistant', 'content': '...'}]
         chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = sample['rejected']  # 同上
 
+        # 将 list 格式的对话转换成纯文本字符串
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
@@ -183,11 +189,12 @@ class DPODataset(Dataset):
         )
 
         chosen_input_ids = chosen_encoding['input_ids']
-        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
+        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids) # 生成 mask (用于标记哪些 token 是助手的回答，需要计算 loss)
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
 
+        # 输入是 x (0 到 N-1)，目标是 y (1 到 N)
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
@@ -206,20 +213,34 @@ class DPODataset(Dataset):
         }
 
     def generate_loss_mask(self, input_ids):
+        # 只保留 Assistant 回答部分的 Loss，忽略 User 输入和 Padding。
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
+            # 1. 寻找 Assistant 回答的“开始标记” (例如 "assistant\n")
+            # 检查当前位置 i 是否匹配 bos_id 序列
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                # 找到了开始标记，start 指向回答内容的第一个 token
                 start = i + len(self.bos_id)
                 end = start
+
+                # 2. 寻找 Assistant 回答的“结束标记” (例如 "<eos>\n")
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+
+                # 3. 将 Start 到 End 之间的部分 mask 设为 1
+                # 这部分就是模型实际生成的回答，我们需要计算它的 Loss
+                # min(..., max_length) 防止越界
+                # end + len(self.eos_id) 是为了让模型学会生成结束符 (EOS) 本身
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
+                
+                # 更新 i 指针，跳过这段已经处理完的回答，继续寻找下一轮对话（如果是多轮对话）
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
+                # 如果没匹配到开始标记，指针后移一位继续找
                 i += 1
         return loss_mask
 
@@ -230,7 +251,10 @@ class RLAIFDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset('json', data_files=data_path, split='train')
+        # 获取特殊 token 的 ID。这里尝试获取 "<BOS>assistant" 对应的 input_ids
+        # add_special_tokens=False 表示不要自动在首尾添加额外的特殊符
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
+        # 获取结束符 (EOS token) 对应的 input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
 
     def __len__(self):
@@ -240,12 +264,19 @@ class RLAIFDataset(Dataset):
         messages = []
         answer = ''
         for i, turn in enumerate(conversations):
+            # 根据索引的奇偶性判断角色。偶数轮(0, 2, 4...)是 user，奇数轮(1, 3, 5...)是 assistant
+            # 这种写法强制假设对话是 user 和 assistant 严格交替进行的
             role = 'user' if i % 2 == 0 else 'assistant'
+
             messages.append({"role": role, "content": turn['content']})
+
+            # 不断覆盖 answer，当循环结束时，answer 保存的就是对话列表中的最后一句话
+            # （通常这一句应该是 assistant 给出的目标回复）
             answer = turn['content']
+
         prompt = self.tokenizer.apply_chat_template(
-            messages[:-1],
-            tokenize=False,
+            messages[:-1], # messages[:-1] 切片表示：取除了最后一句话之外的所有对话（即历史上下文作为 Prompt）
+            tokenize=False,# False 表示返回字符串，而不是 token IDs
             add_generation_prompt=True  # 这里需要True
         )
         prompt = post_processing_chat(prompt)
@@ -255,6 +286,7 @@ class RLAIFDataset(Dataset):
         sample = self.samples[index]
         prompt, answer = self.create_chat_prompt(sample['conversations'])
 
+        # 注意这里返回的是普通字符串字典，并没有将其转换为 Tensor
         return {
             'prompt': prompt,
             'answer': answer
@@ -276,3 +308,53 @@ if __name__ == "__main__":
     #     prompt = sftDataset.create_chat_prompt(sample["conversations"])
     #     print("--- Sample {} ---\n{}\n".format(i, prompt))
     print(sftDataset[0])
+
+
+
+    print("\nRLAIF dataset")
+    rlaifDataset = RLAIFDataset('../dataset/minimind_dataset/rlaif-mini.jsonl', tokenizer, max_length=1024)
+    for i in range(min(2, len(rlaifDataset))):
+        print(f"{rlaifDataset[i]=}")
+
+    
+    print("\nDPO dataset")
+    dpoDataset = DPODataset('../dataset/minimind_dataset/dpo.jsonl', tokenizer, max_length=1024)
+    for i in range(min(1, len(dpoDataset))):
+        out = dpoDataset[i]
+        print("=" * 60)
+        print("--- Sample {} ---".format(i))
+
+        # ---------- chosen ----------
+        print("\n[chosen]")
+        x_chosen = out["x_chosen"]
+        mask_chosen = out["mask_chosen"]
+        chosen_ids = x_chosen.tolist()
+        chosen_len = len(chosen_ids)
+        if tokenizer.pad_token_id is not None:
+            while chosen_len > 0 and chosen_ids[chosen_len - 1] == tokenizer.pad_token_id:
+                chosen_len -= 1
+        print("解码前 (input_ids, 去 pad 后长度 {}):".format(chosen_len))
+        print(chosen_ids[:chosen_len])
+        print("解码后 (文本):")
+        print(tokenizer.decode(chosen_ids[:chosen_len], skip_special_tokens=False))
+        print("mask_chosen (0=不计算 loss, 1=计算, 长度 {}):".format(mask_chosen.shape[0]))
+        print(mask_chosen.tolist())
+        print("mask_chosen 非零个数:", mask_chosen.sum().item())
+
+        # ---------- rejected ----------
+        print("\n[rejected]")
+        x_rejected = out["x_rejected"]
+        mask_rejected = out["mask_rejected"]
+        rej_ids = x_rejected.tolist()
+        rej_len = len(rej_ids)
+        if tokenizer.pad_token_id is not None:
+            while rej_len > 0 and rej_ids[rej_len - 1] == tokenizer.pad_token_id:
+                rej_len -= 1
+        print("解码前 (input_ids, 去 pad 后长度 {}):".format(rej_len))
+        print(rej_ids[:rej_len])
+        print("解码后 (文本):")
+        print(tokenizer.decode(rej_ids[:rej_len], skip_special_tokens=False))
+        print("mask_rejected (0=不计算 loss, 1=计算, 长度 {}):".format(mask_rejected.shape[0]))
+        print(mask_rejected.tolist())
+        print("mask_rejected 非零个数:", mask_rejected.sum().item())
+        print()

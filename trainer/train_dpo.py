@@ -22,30 +22,63 @@ warnings.filterwarnings('ignore')
 
 
 def logits_to_log_probs(logits, labels):
+    """
+    工具函数：将模型的原始输出 logits 转换为对应 label 的 log 概率。
+    这对于计算 DPO Loss 至关重要，因为我们需要知道模型生成特定 token 的概率。
+    """
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
+    
+    # 1. 对 logits 进行 log_softmax 归一化，得到所有词汇的 log 概率
     log_probs = F.log_softmax(logits, dim=2)
+
+    # 2. gather 操作：只提取 labels 对应位置的那个 token 的概率
+    # index=labels.unsqueeze(2) 将 labels 维度变为 (batch, seq, 1) 以匹配 gather 需求
+    # .squeeze(-1) 将结果变回 (batch, seq)
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+    """
+    DPO Loss 的核心计算函数。
+    公式: Loss = -log σ(β * (log(π_theta(yw)/π_ref(yw)) - log(π_theta(yl)/π_ref(yl))))
+    """
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
+    # 这里的 batch_size 实际上包含了 chosen 和 rejected 拼接后的数量 (即 2 * 真实 batch_size)
     # https://github.com/jingyaogong/minimind/issues/298
+
+    # 1. 计算每个样本的有效长度（排除 padding）
+    # clamp_min(1e-8) 是为了防止全 padding 的异常数据导致除以 0
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
+
+    # 2. 计算整个句子的平均 log 概率。乘以 mask 是为了把 padding 部分的概率置为 0，然后求和并除以有效长度
+    # 1)
+    # 这里的 .sum(dim=1) 在数学上执行的是 从“单个词的概率”到“整句话的概率”的转换:
+    # 在概率论中，计算一个序列（一句话）的生成概率，是将其中每个词（Token）的概率相乘。
+    # 但是因为我们是在 对数空间 (Log Space) 操作，乘法就变成了加法。
+    # 2)
+    # 为什么要除以 seq_lengths？因为我们需要计算的是平均每个token的概率，而不是整个句子的概率。
+    # 虽然 sum 算出了整句话的概率，但长句子天然比短句子的 Sum 值更小（因为 Log 概率是负数，加得越多越负）。
+    # 如果不做归一化，DPO 可能会错误地认为短句子总是比长句子“概率更高/更好”。
+    # 因此，代码最后除以了句子的有效长度，计算的是 “平均每个 Token 的 Log 概率”，这样长短句就可以公平比较了。
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
-    # 将 chosen 和 rejected 数据分开
+    # 3. 将拼接在一起的数据拆分回 chosen (好回答) 和 rejected (坏回答)
+    # 假设输入 batch 是 [chosen_1, chosen_2, ..., rejected_1, rejected_2, ...]
     batch_size = ref_log_probs.shape[0]
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
+    # 4. 计算策略模型对 好回答 和 坏回答 的 log 概率差
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
+    # 5. 计算参考模型对 好回答 和 坏回答 的 log 概率差 (这是基准)
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
+    
     logits = pi_logratios - ref_logratios
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
@@ -61,6 +94,9 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         y_rejected = batch['y_rejected'].to(args.device)
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
+        
+        # 拼接数据：将 chosen 和 rejected 拼在一起，一次性送入模型计算，提高效率
+        # x 的 shape 变为 (batch_size * 2, seq_len)
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
@@ -70,41 +106,45 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             param_group['lr'] = lr
 
         with autocast_ctx:
-            with torch.no_grad():
+            # --- 参考模型 (Ref Model) 计算 ---
+            with torch.no_grad(): # 参考模型不更新梯度，必须 no_grad
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
             ref_log_probs = logits_to_log_probs(ref_logits, y)
             
+            # --- 策略模型 (Policy Model) 计算 ---
             outputs = model(x)
             logits = outputs.logits
             policy_log_probs = logits_to_log_probs(logits, y)
             
             dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            # 总损失 = DPO损失 + 辅助损失 (aux_loss 通常用于 MoE 的负载均衡，非 MoE 为 0)
             loss = dpo_loss_val + outputs.aux_loss
+            # 梯度累积平均
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_dpo_loss = dpo_loss_val.item()
             current_aux_loss = outputs.aux_loss.item()
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / step * iters // 60 - spend_time // 60
             
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, dpo_loss: {current_dpo_loss:.4f}, aux_loss: {current_aux_loss:.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
             
             if wandb: wandb.log({"loss": current_loss, "dpo_loss": current_dpo_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -112,7 +152,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir=f'{args.save_dir}/checkpoints')
             model.train()
             del state_dict
 
@@ -126,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_weight', default='dpo', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
+    # DPO 学习率通常极小 (e.g. 1e-7 ~ 5e-8)，比 SFT 小很多
     parser.add_argument("--learning_rate", type=float, default=4e-8, help="初始学习率（建议<=5e-8避免遗忘）")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -141,6 +182,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl", help="DPO训练数据路径")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    # beta 是 DPO 关键参数，控制对参考模型的偏离程度。值越大，越不允许偏离 Reference Model
     parser.add_argument('--beta', default=0.1, type=float, help="DPO中的beta参数")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-DPO", help="wandb项目名")
@@ -155,7 +197,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=f'{args.save_dir}/checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -172,6 +214,7 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型和参考模型 ==========
+    # 初始化 Policy Model (我们要训练的模型)
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -191,6 +234,7 @@ if __name__ == "__main__":
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
+        model = getattr(model, '_orig_mod', model)
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])

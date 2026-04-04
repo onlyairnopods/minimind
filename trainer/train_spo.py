@@ -191,7 +191,7 @@ def spo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_tokeni
         response_masks = completion_mask.float()  # [B, R]
         rho = value_tracker.update(rewards, per_token_logps.detach(), response_masks)
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
@@ -224,7 +224,7 @@ def spo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_tokeni
                     "learning_rate": current_lr
                 })
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -233,7 +233,7 @@ def spo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_tokeni
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
+                         epoch=epoch, step=step, wandb=wandb, save_dir=f'{args.save_dir}/checkpoints', scheduler=scheduler)
             model.train()
             del state_dict
 
@@ -279,7 +279,7 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=f'{args.save_dir}/checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -326,6 +326,7 @@ if __name__ == "__main__":
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
+        model = getattr(model, '_orig_mod', model)
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scheduler.load_state_dict(ckp_data['scheduler'])
