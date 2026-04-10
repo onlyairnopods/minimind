@@ -42,14 +42,18 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)).view(shift_labels.size())
 
             loss_mask = (shift_labels != -100).float()
+            # 【推理蒸馏核心逻辑】特殊标签识别
+            # 找到 标签中所有属于 <think>, </think>, <answer>, </answer> 组成部分的 Token 位置
             sp_ids = torch.isin(shift_labels.view(-1),
                                 torch.tensor(start_of_think_ids + end_of_think_ids
                                              + start_of_answer_ids + end_of_answer_ids
                                              ).to(args.device))
             loss_mask_flat = loss_mask.view(-1)
             loss_mask_sum = loss_mask_flat.sum()
+            # 将特殊标签位置的权重设为 10（普通 Token 默认为 1），强化模型对推理格式的记忆
             loss_mask_flat[sp_ids] = 10
             loss_mask = loss_mask_flat.view(shift_labels.size())
+            # 对损失值应用掩码并取平均值
             logits_loss = (loss * loss_mask).sum() / loss_mask_sum
             loss = logits_loss + res.aux_loss
             loss = loss / args.accumulation_steps
