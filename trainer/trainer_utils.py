@@ -159,8 +159,8 @@ class SkipBatchSampler(Sampler):
 
 class LMForRewardModel:
     def __init__(self, model_path, device="cuda", dtype=torch.float16):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True, local_files_only=True)
         self.model = self.model.to(device).eval()
         self.device = device
 

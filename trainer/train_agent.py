@@ -179,6 +179,27 @@ def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_ge
             all_unfinished.append(unfinished)
     return all_completions, all_contexts, all_prompt_ids, all_response_ids, all_response_masks, all_response_old_logps, all_turn_outputs, all_unfinished
 
+
+def select_rank_device(device_arg, fallback, local_rank=0):
+    if not device_arg:
+        return fallback
+    devices = [device.strip() for device in str(device_arg).split(",") if device.strip()]
+    if not devices:
+        return fallback
+    return devices[local_rank % len(devices)]
+
+
+def same_torch_device(lhs, rhs):
+    lhs_device = torch.device(lhs)
+    rhs_device = torch.device(rhs)
+    if lhs_device.type != rhs_device.type:
+        return False
+    if lhs_device.type != "cuda":
+        return True
+    lhs_index = torch.cuda.current_device() if lhs_device.index is None else lhs_device.index
+    rhs_index = torch.cuda.current_device() if rhs_device.index is None else rhs_device.index
+    return lhs_index == rhs_index
+
 # ======== Reward 计算 ========
 def validate_gt_in_text(text, gt_list):
     text, text_num = str(text), str(text).replace(',', '')
@@ -248,7 +269,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         last_step = step
 
         with torch.no_grad():
-            completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device)
+            completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.rollout_device)
 
         prompts = [tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True, tools=t) for m, t in zip(messages_batch, tools_batch)]
         packed_samples = []
@@ -280,7 +301,9 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             per_token_logps = F.log_softmax(logits, dim=-1).gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
         with torch.no_grad():
-            ref_per_token_logps = compute_per_token_logps(ref_model, input_ids, input_ids.size(1) - 1, attention_mask=full_mask)
+            ref_input_ids = input_ids.to(args.ref_device) if not same_torch_device(args.ref_device, args.device) else input_ids
+            ref_full_mask = full_mask.to(args.ref_device) if not same_torch_device(args.ref_device, args.device) else full_mask
+            ref_per_token_logps = compute_per_token_logps(ref_model, ref_input_ids, input_ids.size(1) - 1, attention_mask=ref_full_mask).to(args.device)
 
         completion_mask = full_response_masks[:, 1:]
         is_eos = (input_ids[:, 1:] == tokenizer.eos_token_id) & completion_mask.bool()
@@ -379,6 +402,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
     parser.add_argument("--learning_rate", type=float, default=3e-7, help="学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
+    parser.add_argument("--rollout_device", type=str, default=None, help="rollout模型设备，逗号分隔时按local_rank轮转，如cuda:2,cuda:3")
+    parser.add_argument("--reward_device", type=str, default=None, help="Reward模型设备，逗号分隔时按local_rank轮转，如cuda:2,cuda:3")
+    parser.add_argument("--ref_device", type=str, default=None, help="Reference模型设备，逗号分隔时按local_rank轮转，如cuda:2,cuda:3")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="数据类型 bfloat16/float16")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
@@ -414,6 +440,11 @@ if __name__ == "__main__":
 
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    args.rollout_device = select_rank_device(args.rollout_device, args.device, local_rank)
+    args.reward_device = select_rank_device(args.reward_device, args.device, local_rank)
+    args.ref_device = select_rank_device(args.ref_device, args.device, local_rank)
+    placement = f"[rank {dist.get_rank() if dist.is_initialized() else 0}] train={args.device}, rollout={args.rollout_device}, reward={args.reward_device}, ref={args.ref_device}"
+    print(placement) if dist.is_initialized() else Logger(placement)
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -434,17 +465,24 @@ if __name__ == "__main__":
 
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 
-    ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
+    ref_model, _ = init_model(lm_config, args.from_weight, device=args.ref_device)
     ref_model = ref_model.eval().requires_grad_(False)
 
-    reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
+    reward_model = LMForRewardModel(args.reward_model_path, device=args.reward_device, dtype=torch.float16)
     Logger(f'Loaded reward model from {args.reward_model_path}')
+
+    rollout_policy_model = model
+    if args.rollout_engine == "torch" and not same_torch_device(args.rollout_device, args.device):
+        rollout_policy_model, _ = init_model(lm_config, args.from_weight, device=args.rollout_device)
+        rollout_policy_model = rollout_policy_model.eval().requires_grad_(False)
+        Logger(f'Loaded rollout model on {args.rollout_device}')
+
     # Rollout引擎
     rollout_engine = create_rollout_engine(
         engine_type=args.rollout_engine,
-        policy_model=model,
+        policy_model=rollout_policy_model,
         tokenizer=tokenizer,
-        device=args.device,
+        device=args.rollout_device,
         autocast_ctx=autocast_ctx,
         sglang_base_url=args.sglang_base_url,
         sglang_model_path=args.sglang_model_path,

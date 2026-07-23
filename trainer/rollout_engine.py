@@ -36,6 +36,11 @@ def compute_per_token_logps(model, input_ids: Tensor, n_keep: int, attention_mas
     return torch.stack(per_token_logps)
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    model = model.module if isinstance(model, DistributedDataParallel) else model
+    return getattr(model, '_orig_mod', model)
+
+
 # ===== Rollout 结果 =====
 @dataclass
 class RolloutResult:
@@ -69,7 +74,9 @@ class TorchRolloutEngine(RolloutEngine):
         self.autocast_ctx = autocast_ctx
     
     def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
-        model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
+        model = unwrap_model(self.policy_model)
+        prompt_ids = prompt_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
         ctx = self.autocast_ctx if self.autocast_ctx else nullcontext()
         with torch.no_grad(), ctx:
             output_ids = model.generate(
@@ -92,7 +99,15 @@ class TorchRolloutEngine(RolloutEngine):
                              attention_mask.new_ones(output_ids.size(0), completion_ids.size(1)))
     
     def update_policy(self, model: torch.nn.Module):
-        self.policy_model = model
+        source = unwrap_model(model)
+        target = unwrap_model(self.policy_model)
+        if source is target:
+            self.policy_model = model
+            return
+        state_dict = {k: v.detach().cpu() for k, v in source.state_dict().items()}
+        target.load_state_dict(state_dict, strict=True)
+        target.eval()
+        del state_dict
 
 
 # ===== SGLang HTTP API 推理引擎 =====
